@@ -144,12 +144,16 @@ async function blocoMes(params){
 // Datas do mart vêm como "YYYY-MM-DD" (string). Fatia direto — NUNCA new Date(str), que interpreta
 // como UTC e desloca 1 dia no fuso do servidor (BRT). Só cai no Date() se vier um objeto Date mesmo.
 function _iso(d){ if(typeof d==='string') return d.slice(0,10); const x=new Date(d); return x.getFullYear()+'-'+String(x.getMonth()+1).padStart(2,'0')+'-'+String(x.getDate()).padStart(2,'0'); }
-async function blocoDia(){
+async function blocoDia(params){
+  // dia de referência: ?d=YYYY-MM-DD (qualquer dia passado) ou hoje (current_date). Janela de 25 dias até ele.
+  const dp = params && params.get ? params.get('d') : null;
+  const dref = /^\d{4}-\d{2}-\d{2}$/.test(dp||'') ? dp : null;
+  const A = dref ? `date '${dref}'` : 'current_date';
   const [forc, vod, diario] = await Promise.all([
-    mart(`SELECT dtentr::date d, nrorc, round(sum(prcobr)) brt, round(sum(vrdsc)) dsc FROM mart.f_venda WHERE dtentr>=current_date-25 AND dtentr<=current_date AND nrorc>0 GROUP BY 1,2`),
+    mart(`SELECT dtentr::date d, nrorc, round(sum(prcobr)) brt, round(sum(vrdsc)) dsc FROM mart.f_venda WHERE dtentr>=${A}-25 AND dtentr<=${A} AND nrorc>0 GROUP BY 1,2`),
     mart(`SELECT medico, paciente, nr_orcamento nr, ativo_principal ativo, round(orcado) o, round(venda) v FROM mart.venda_orcado_detalhe
-          WHERE nr_orcamento IN (SELECT DISTINCT nrorc FROM mart.f_venda WHERE dtentr>=current_date-25 AND dtentr<=current_date AND nrorc>0)`),
-    mart(`SELECT data::date d, (data=current_date) ishoje, (array['Dom','Seg','Ter','Qua','Qui','Sex','Sáb'])[extract(dow from data)::int+1] dow, round(venda) venda, round(orcado) orcado, round(meta) meta, round(venda_bruta) bruta FROM mart.diario WHERE data>=current_date-25 AND data<=current_date ORDER BY 1 DESC`),
+          WHERE nr_orcamento IN (SELECT DISTINCT nrorc FROM mart.f_venda WHERE dtentr>=${A}-25 AND dtentr<=${A} AND nrorc>0)`),
+    mart(`SELECT data::date d, (data=${A}) ishoje, (array['Dom','Seg','Ter','Qua','Qui','Sex','Sáb'])[extract(dow from data)::int+1] dow, round(venda) venda, round(orcado) orcado, round(meta) meta, round(venda_bruta) bruta FROM mart.diario WHERE data>=${A}-25 AND data<=${A} ORDER BY 1 DESC`),
   ]);
   // "hoje" = a data REAL de hoje (mart.diario tem a linha do dia mesmo sem venda), não o último dia com venda.
   const diarioBy = {}; let hoje=null;
