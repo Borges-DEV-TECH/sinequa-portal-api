@@ -28,6 +28,9 @@ const MB     = (process.env.MB_URL || 'http://localhost:3000').replace(/\/$/,'')
 const MBKEY  = process.env.MB_API_KEY || '';
 const TOKEN  = process.env.PORTAL_TOKEN || 'sinequa2026';
 const ORIGENS = (process.env.PORTAL_ORIGENS || '*').split(',').map(s=>s.trim());
+carregaEnv(path.join(__dirname,'ia.env'));                          // opcional: ANTHROPIC_API_KEY, CHAT_MODEL
+const IA_KEY   = process.env.ANTHROPIC_API_KEY || '';
+const IA_MODEL = process.env.CHAT_MODEL || 'claude-haiku-4-5-20251001';
 
 // ---------- consulta ao mart — dois backends, MESMO SQL ----------
 // · Metabase export /json (default): funciona de qualquer lugar via Tailscale, sem teto de 2000 linhas.
@@ -284,6 +287,30 @@ async function blocoBusca(){
 
 const BLOCOS = { ano: blocoAno, mes: blocoMes, dia: blocoDia, producao: blocoProd, busca: blocoBusca };
 
+// ---------- Chatbot (Nível 1): responde sobre o CONTEXTO do painel via Claude ----------
+const IA_SYS = `Você é o assistente do Portal Sinequa, o painel de gestão da Sinequa Farma (farmácia de manipulação em São Paulo). Responde perguntas do dono/gestor sobre os números do painel.
+
+Regras:
+- Português, direto e objetivo, como um analista de confiança da casa.
+- Use SOMENTE os dados do CONTEXTO (JSON) abaixo. Se a resposta não estiver lá, diga que esse dado não está no painel — NUNCA invente número.
+- Reais no formato R$ 217.129; percentuais com 1 casa (43,3%).
+- Conciso: 1 a 4 frases, ou uma lista curta. Sem enrolação, sem repetir a pergunta.
+- Glossário: "ativo" = fórmula/princípio ativo; "meta"/"super" = metas do mês; "conversão" = venda/orçado; "recência" = dias desde a última compra.`;
+
+function lerCorpo(req){ return new Promise((res,rej)=>{ let d=''; req.on('data',c=>{ d+=c; if(d.length>2e6) req.destroy(); }); req.on('end',()=>res(d)); req.on('error',rej); }); }
+
+async function chat(messages, contexto){
+  if(!IA_KEY) throw new Error('IA não configurada');
+  const sys = IA_SYS + '\n\nCONTEXTO (JSON):\n' + JSON.stringify(contexto);
+  const r = await fetch('https://api.anthropic.com/v1/messages',{ method:'POST',
+    headers:{ 'x-api-key':IA_KEY, 'anthropic-version':'2023-06-01', 'content-type':'application/json' },
+    body: JSON.stringify({ model:IA_MODEL, max_tokens:800, system:sys, messages }),
+    signal: AbortSignal.timeout(30000) });
+  const j = await r.json();
+  if(!r.ok) throw new Error((j&&j.error&&j.error.message)||('HTTP '+r.status));
+  return (j.content||[]).filter(b=>b.type==='text').map(b=>b.text).join('').trim() || '(sem resposta)';
+}
+
 // ---------- HTTP ----------
 function responde(res, origem, status, corpo){
   const h = {'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store'};
@@ -293,9 +320,25 @@ function responde(res, origem, status, corpo){
 }
 const servidor = http.createServer(async (req,res)=>{
   const origem = req.headers.origin;
-  if(req.method==='OPTIONS'){ res.writeHead(204,{'Access-Control-Allow-Origin':ORIGENS.includes('*')?'*':(ORIGENS.includes(origem)?origem:ORIGENS[0]||'*'),'Access-Control-Allow-Methods':'GET, OPTIONS','Access-Control-Allow-Headers':'x-portal-key','Access-Control-Max-Age':'86400'}); return res.end(); }
+  if(req.method==='OPTIONS'){ res.writeHead(204,{'Access-Control-Allow-Origin':ORIGENS.includes('*')?'*':(ORIGENS.includes(origem)?origem:ORIGENS[0]||'*'),'Access-Control-Allow-Methods':'GET, POST, OPTIONS','Access-Control-Allow-Headers':'x-portal-key, content-type','Access-Control-Max-Age':'86400'}); return res.end(); }
   const url = new URL(req.url,'http://x');
-  if(url.pathname==='/portal/saude') return responde(res,origem,200,{ok:true,hora:new Date().toISOString(),backend:BACKEND,fonte:USA_PG?(process.env.DATABASE_URL?'DATABASE_URL':(process.env.PGHOST||'localhost')+':'+(process.env.PGPORT||5432)+'/'+(process.env.PGDATABASE||'sinequa')):MB});
+  if(url.pathname==='/portal/saude') return responde(res,origem,200,{ok:true,hora:new Date().toISOString(),backend:BACKEND,fonte:USA_PG?(process.env.DATABASE_URL?'DATABASE_URL':(process.env.PGHOST||'localhost')+':'+(process.env.PGPORT||5432)+'/'+(process.env.PGDATABASE||'sinequa')):MB,ia:!!IA_KEY});
+  // Chatbot — POST /portal/chat {messages:[{role,content}], contexto}
+  if(req.method==='POST' && url.pathname==='/portal/chat'){
+    const key = req.headers['x-portal-key'] || url.searchParams.get('key') || '';
+    if(key!==TOKEN) return responde(res,origem,401,{erro:'não autorizado'});
+    try{
+      const body = JSON.parse((await lerCorpo(req)) || '{}');
+      const messages = Array.isArray(body.messages) ? body.messages.filter(m=>m&&m.role&&m.content).slice(-12) : [];
+      if(!messages.length) return responde(res,origem,400,{erro:'sem mensagem'});
+      const resposta = await chat(messages, body.contexto||{});
+      return responde(res,origem,200,{resposta});
+    }catch(e){
+      const semKey = /IA não configurada/.test(e.message||'');
+      console.error('[chat]', e.message);
+      return responde(res,origem, semKey?503:500, {erro: semKey?'O assistente ainda não está configurado no servidor.':'Não consegui responder agora.'});
+    }
+  }
   const m = url.pathname.match(/^\/portal\/([a-z]+)$/);
   if(!m || !BLOCOS[m[1]]) return responde(res,origem,404,{erro:'rota desconhecida'});
   // auth — token compartilhado
