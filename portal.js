@@ -98,30 +98,37 @@ async function blocoAno(){
   return { meses, ativos: ativos.map(r=>({ativo:r.ativo, venda:N(r.venda)})), presc:{ top, outros, total } };
 }
 
-// MÊS — { TOT, DIACAL, ACUM, DIA, REM, SUPERMETA, PRESCR } — mês corrente, dinâmico
-async function blocoMes(){
+// MÊS — { TOT, DIACAL, ACUM, DIA, REM, SUPERMETA, PRESCR, fechado } — mês corrente OU um mês passado (?mes=YYYY-MM)
+async function blocoMes(params){
+  const mp = params && params.get ? params.get('mes') : null;
+  const m = /^\d{4}-\d{2}$/.test(mp||'') ? mp : null;           // valida (evita injeção)
+  const mesIni = m ? `date '${m}-01'` : `date_trunc('month',current_date)::date`;
+  const fimMes = `(${mesIni} + interval '1 month' - interval '1 day')::date`;
+  const refcut = `LEAST(current_date, ${fimMes})`;               // último dia realizado do mês (hoje, ou o fim se já fechou)
+  const mfDiario = `date_trunc('month',data)=date_trunc('month',${mesIni})`;
   const [dias, meds, det, dscRows] = await Promise.all([
-    mart(`SELECT to_char(data,'DD') dd, (array['Dom','Seg','Ter','Qua','Qui','Sex','Sáb'])[extract(dow from data)::int+1] dow,
+    mart(`SELECT to_char(data,'YYYY-MM-DD') iso, to_char(data,'DD') dd, (array['Dom','Seg','Ter','Qua','Qui','Sex','Sáb'])[extract(dow from data)::int+1] dow,
             round(venda) venda, round(orcado) orcado, round(meta) meta, round(venda_bruta) vb,
-            round(venda_acum) va, round(meta_acum) ma, (data<=CURRENT_DATE) ispast
-          FROM mart.diario WHERE date_trunc('month',data)=date_trunc('month',CURRENT_DATE) ORDER BY data`),
+            round(venda_acum) va, round(meta_acum) ma, (data<=${refcut}) ispast
+          FROM mart.diario WHERE ${mfDiario} ORDER BY data`),
     mart(`SELECT medico m, round(sum(orcado)) orc, round(sum(venda)) vda,
             round((sum(desconto)/nullif(sum(venda_bruta),0))::numeric,4) descp
-          FROM mart.medico_diario WHERE date_trunc('month',data)=date_trunc('month',CURRENT_DATE) GROUP BY 1 ORDER BY vda DESC`),
+          FROM mart.medico_diario WHERE ${mfDiario} GROUP BY 1 ORDER BY vda DESC`),
     mart(`SELECT medico, paciente, nr_orcamento nr, ativo_principal ativo, round(orcado) o, round(venda) v
-          FROM mart.venda_orcado_detalhe WHERE ano=extract(year from current_date)::int AND mes=extract(month from current_date)::int`),
+          FROM mart.venda_orcado_detalhe WHERE ano=extract(year from ${mesIni})::int AND mes=extract(month from ${mesIni})::int`),
     mart(`SELECT nrorc, round(sum(prcobr)) brt, round(sum(vrdsc)) dsc FROM mart.f_venda
-          WHERE dtentr>=date_trunc('month',current_date) AND dtentr<=current_date AND nrorc>0 GROUP BY nrorc`),
+          WHERE dtentr>=${mesIni} AND dtentr<=${refcut} AND nrorc>0 GROUP BY nrorc`),
   ]);
   const DIACAL = dias.map(d=>({dd:d.dd, dow:d.dow, venda:N(d.venda), orcado:N(d.orcado), meta:N(d.meta)}));
   const ACUM   = dias.map(d=>({dd:d.dd, va: d.ispast? N(d.va): null, ma: N(d.ma)}));
   const DIA    = DIACAL.filter(d=>d.orcado>0);
   const past = dias.filter(d=>d.ispast), fut = dias.filter(d=>!d.ispast);
+  const fechado = fut.length===0;                                // mês inteiro já passou (nada de futuro)
   const v_liq = past.reduce((s,d)=>s+N(d.venda),0), v_bruta = past.reduce((s,d)=>s+N(d.vb),0);
   const orc = past.reduce((s,d)=>s+N(d.orcado),0);
   const meta_ate = past.reduce((s,d)=>s+N(d.meta),0), meta_mes = dias.reduce((s,d)=>s+N(d.meta),0);
   const ultDia = [...past].reverse().find(d=>N(d.venda)>0);
-  const ref = ultDia? new Date().getFullYear()+'-'+String(new Date().getMonth()+1).padStart(2,'0')+'-'+ultDia.dd : null;
+  const ref = ultDia? ultDia.iso : (dias.length? dias[dias.length-1].iso : null);
   const TOT = { v_liq, v_bruta, orc, meta_ate, meta_mes, ref };
   const SUPERMETA = Math.round(meta_mes*1.065);
   const REM = { falta: Math.max(meta_mes - v_liq,0), dias: fut.length, dias_uteis: fut.filter(d=>N(d.meta)>0).length };
@@ -130,7 +137,7 @@ async function blocoMes(){
   const detArr = det.filter(r=>idx[r.medico]!=null).map(r=>[idx[r.medico], r.paciente, N(r.nr), r.ativo, N(r.o), N(r.v)]);
   const dsc={}; dscRows.forEach(r=>{ dsc[N(r.nrorc)]=[N(r.brt), N(r.dsc)]; });
   const PRESCR = { ref, medicos, det: detArr, dsc };
-  return { TOT, DIACAL, ACUM, DIA, REM, SUPERMETA, PRESCR };
+  return { TOT, DIACAL, ACUM, DIA, REM, SUPERMETA, PRESCR, fechado };
 }
 
 // DIA — window.HOJE = { hoje, dias:[{d,lbl}], byDay:{ 'YYYY-MM-DD': {ag:{venda,orcado,meta,bruta,dow}, nped, medicos:[{m,vda,brt,dsc}], det:[[mi,pac,nr,ativo,orc,vda]], dsc:{nr:[brt,dsc]}} } }
@@ -350,7 +357,7 @@ const servidor = http.createServer(async (req,res)=>{
   const key = req.headers['x-portal-key'] || url.searchParams.get('key') || '';
   if(key!==TOKEN) return responde(res,origem,401,{erro:'não autorizado'});
   try{
-    const dados = await BLOCOS[m[1]]();
+    const dados = await BLOCOS[m[1]](url.searchParams);
     return responde(res,origem,200,dados);
   }catch(e){
     console.error('[erro]',m[1],e.message);
