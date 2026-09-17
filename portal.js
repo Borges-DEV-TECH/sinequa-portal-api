@@ -336,7 +336,7 @@ const servidor = http.createServer(async (req,res)=>{
     }catch(e){
       const semKey = /IA não configurada/.test(e.message||'');
       console.error('[chat]', e.message);
-      return responde(res,origem, semKey?503:500, {erro: semKey?'O assistente ainda não está configurado no servidor.':'Não consegui responder agora.'});
+      return responde(res,origem, semKey?503:500, {erro: semKey?'O assistente ainda não está configurado no servidor.':'Não consegui responder agora.', detalhe:(e.message||'').slice(0,300)});
     }
   }
   const m = url.pathname.match(/^\/portal\/([a-z]+)$/);
