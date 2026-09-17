@@ -134,18 +134,23 @@ async function blocoMes(){
 }
 
 // DIA — window.HOJE = { hoje, dias:[{d,lbl}], byDay:{ 'YYYY-MM-DD': {ag:{venda,orcado,meta,bruta,dow}, nped, medicos:[{m,vda,brt,dsc}], det:[[mi,pac,nr,ativo,orc,vda]], dsc:{nr:[brt,dsc]}} } }
-function _iso(d){ const x=new Date(d); return x.getFullYear()+'-'+String(x.getMonth()+1).padStart(2,'0')+'-'+String(x.getDate()).padStart(2,'0'); }
+// Datas do mart vêm como "YYYY-MM-DD" (string). Fatia direto — NUNCA new Date(str), que interpreta
+// como UTC e desloca 1 dia no fuso do servidor (BRT). Só cai no Date() se vier um objeto Date mesmo.
+function _iso(d){ if(typeof d==='string') return d.slice(0,10); const x=new Date(d); return x.getFullYear()+'-'+String(x.getMonth()+1).padStart(2,'0')+'-'+String(x.getDate()).padStart(2,'0'); }
 async function blocoDia(){
-  const [days, forc, vod, diario] = await Promise.all([
-    mart(`SELECT dtentr::date d, count(distinct nrorc) nped FROM mart.f_venda WHERE dtentr>=current_date-25 AND dtentr<=current_date AND nrorc>0 GROUP BY 1 ORDER BY 1 DESC LIMIT 11`),
+  const [forc, vod, diario] = await Promise.all([
     mart(`SELECT dtentr::date d, nrorc, round(sum(prcobr)) brt, round(sum(vrdsc)) dsc FROM mart.f_venda WHERE dtentr>=current_date-25 AND dtentr<=current_date AND nrorc>0 GROUP BY 1,2`),
     mart(`SELECT medico, paciente, nr_orcamento nr, ativo_principal ativo, round(orcado) o, round(venda) v FROM mart.venda_orcado_detalhe
           WHERE nr_orcamento IN (SELECT DISTINCT nrorc FROM mart.f_venda WHERE dtentr>=current_date-25 AND dtentr<=current_date AND nrorc>0)`),
-    mart(`SELECT data::date d, (array['Dom','Seg','Ter','Qua','Qui','Sex','Sáb'])[extract(dow from data)::int+1] dow, round(venda) venda, round(orcado) orcado, round(meta) meta, round(venda_bruta) bruta FROM mart.diario WHERE data>=current_date-25 AND data<=current_date`),
+    mart(`SELECT data::date d, (data=current_date) ishoje, (array['Dom','Seg','Ter','Qua','Qui','Sex','Sáb'])[extract(dow from data)::int+1] dow, round(venda) venda, round(orcado) orcado, round(meta) meta, round(venda_bruta) bruta FROM mart.diario WHERE data>=current_date-25 AND data<=current_date ORDER BY 1 DESC`),
   ]);
-  const dayList = days.map(r=>_iso(r.d));
-  const npedBy = {}; days.forEach(r=>npedBy[_iso(r.d)]=N(r.nped));
-  const diarioBy = {}; diario.forEach(r=>diarioBy[_iso(r.d)]={venda:N(r.venda),orcado:N(r.orcado),meta:N(r.meta),bruta:N(r.bruta),dow:r.dow});
+  // "hoje" = a data REAL de hoje (mart.diario tem a linha do dia mesmo sem venda), não o último dia com venda.
+  const diarioBy = {}; let hoje=null;
+  diario.forEach(r=>{ const d=_iso(r.d); diarioBy[d]={venda:N(r.venda),orcado:N(r.orcado),meta:N(r.meta),bruta:N(r.bruta),dow:r.dow}; if(r.ishoje) hoje=d; });
+  if(!hoje && diario.length) hoje=_iso(diario[0].d);   // fallback: dia mais recente
+  // dias no seletor: os que tiveram movimento (orçou ou vendeu) + SEMPRE o de hoje — os 11 mais recentes
+  const dayList = diario.filter(r=> N(r.orcado)>0 || N(r.venda)>0 || r.ishoje).slice(0,11).map(r=>_iso(r.d));
+  const npedBy = {}; forc.forEach(r=>{ const d=_iso(r.d); npedBy[d]=(npedBy[d]||0)+1; });
   // f_venda: nrorc -> {day, brt, dsc}
   const forcByNr = {}; forc.forEach(r=>{ forcByNr[N(r.nrorc)]={day:_iso(r.d), brt:N(r.brt), dsc:N(r.dsc)}; });
   // vod agrupado por nrorc
@@ -198,7 +203,7 @@ async function blocoProd(){
   }
   // ---- semanas ----
   const dayAgg={}; // d -> {prazo,atraso,ematraso,producao}
-  sem.forEach(r=>{ const d=_isoD(new Date(r.d)); const o=(dayAgg[d] ||= {prazo:0,atraso:0,ematraso:0,producao:0});
+  sem.forEach(r=>{ const d=_iso(r.d); const o=(dayAgg[d] ||= {prazo:0,atraso:0,ematraso:0,producao:0});
     if(r.st==='Pronta no Prazo')o.prazo+=N(r.n); else if(r.st==='Pronta com Atraso')o.atraso+=N(r.n); else if(r.st==='Em atraso')o.ematraso+=N(r.n); else if(r.st==='Em produção')o.producao+=N(r.n); });
   const wkMap={};
   Object.keys(dayAgg).forEach(d=>{ const wk=_monday(d); (wkMap[wk] ||= {}); wkMap[wk][d]=dayAgg[d]; });
@@ -212,11 +217,11 @@ async function blocoProd(){
   });
   const hoje = _monday(_isoD(new Date()));
   // ---- atrByWk ----
-  const atrByWk={}; atr.forEach(r=>{ const wk=_monday(_isoD(new Date(r.prev))); (atrByWk[wk] ||= []).push({ped:N(r.ped),chave:r.chave,paciente:r.paciente,prev:_isoD(new Date(r.prev)),saida:r.saida,envio:r.envio,st:r.st}); });
+  const atrByWk={}; atr.forEach(r=>{ const wk=_monday(_iso(r.prev)); (atrByWk[wk] ||= []).push({ped:N(r.ped),chave:r.chave,paciente:r.paciente,prev:_iso(r.prev),saida:r.saida,envio:r.envio,st:r.st}); });
   // ---- pcpByDia ----
   const pcpByDia={}, daysSeen=new Set();
   const byDayPed={}; // d -> ped -> {paciente,envio,formulas:[]}
-  fila.forEach(r=>{ const d=_isoD(new Date(r.d)); daysSeen.add(d); const ped=N(r.ped);
+  fila.forEach(r=>{ const d=_iso(r.d); daysSeen.add(d); const ped=N(r.ped);
     const dm=(byDayPed[d] ||= {}); const p=(dm[ped] ||= {ped,paciente:r.paciente,envio:r.envio,formulas:[]});
     p.formulas.push({serier:N(r.serier), etapa:r.etapa, st:r.st}); });
   Object.keys(byDayPed).forEach(d=>{
